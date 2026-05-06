@@ -1,4 +1,4 @@
-# 🚀 High Throughput Order Ingestion System
+# 🚀 High Throughput Order Ingestion System (10M Writes in DB)
 ### Production-Grade Design (10k+/sec Safe)
 
 ---
