@@ -1,0 +1,74 @@
+const express = require("express")
+const amqp = require("amqplib")
+const { MongoClient } = require("mongodb")
+
+const app = express()
+app.use(express.json())
+
+const BATCH_SIZE = 500
+const FLUSH_INTERVAL = 100
+
+let buffer = []
+let messages = []
+let isFlushing = false
+let shuttingDown = false
+let channel = null
+let collection = null
+
+// intialize DB and RabbitMQ
+async function init() {
+    // connect to MongoDB
+    const mongoClient = new MongoClient(process.env.MONGO_URI, {
+        maxPoolSize: 20
+    })
+    await mongoClient.connect()
+    collection = mongoClient.db("test").collection("order_items")
+
+    // ensure index for efficient lookups
+    await collection.createIndex({ _id: 1 }, { unique: true })
+    await collection.createIndex({ orderId: 1 })
+
+    // connect to RabbitMQ
+    const conn = await amqp.connect(process.env.RABBIT_URL)
+    channel = await conn.createChannel()
+
+    // ----- Dead Letter Exchange -----
+
+    // Exchange where permanently failed messages go
+    await channel.assertExchange("dlx", "direct", { durable: true })
+
+    // Dead Letter Queue (stores failed messages)
+    await channel.assertQueue("order_items_dlq", { durable: true })
+
+    // Bind DLQ to DLX with routing key "dead"
+    await channel.bindQueue("order_items_dlq", "dlx", "dead");
+
+    // Retry Exchange (for retry logic)
+    await channel.assertExchange("retry_exchange", "direct", { durable: true });
+
+    // Retry Queues (Exponential Backoff)
+    await createRetryQueue("order_items_retry_1", 5000);
+    await createRetryQueue("order_items_retry_2", 15000);
+    await createRetryQueue("order_items_retry_3", 30000);
+
+    // Main Queue
+    await channel.assertQueue("order_items", {
+        durable: true,
+        arguments: {
+            // If message fails → send to retry exchange (NOT DLQ directly)
+            "x-dead-letter-exchange": "retry_exchange",
+            "x-dead-letter-routing-key": "retry",
+
+            // Lazy mode → store messages on disk (good for large queues)
+            "x-queue-mode": "lazy"
+        }
+    });
+
+    channel.prefetch(BATCH_SIZE);
+
+    channel.consume("order_items", onMessage, { noAck: false });
+
+    setInterval(flush, FLUSH_INTERVAL);
+
+    console.log("✅ Server + Worker started");
+}
