@@ -10,7 +10,6 @@ app.use(express.json());
 
 const BATCH_SIZE = 500;
 const FLUSH_INTERVAL = 100;
-// const ARTIFICIAL_DB_DELAY = 2000; // ← bump this up from 200ms to 2000ms to make DB slow more
 const ARTIFICIAL_DB_DELAY = 0; // ← In Production set it to 0
 
 /* STATE */
@@ -126,11 +125,10 @@ app.post("/add-item", async (req, res) => {
 
 app.post("/replay-dlq", async (req, res) => {
 
-    const limit = parseInt(req.query.limit) || 1000; // default max 1000
+    const limit = parseInt(req.query.limit) || 1000;
     const batch = [];
     const msgs = [];
 
-    // drain up to limit messages into memory first
     while (batch.length < limit) {
 
         const msg = await channel.get("order_items_dlq", { noAck: false });
@@ -145,7 +143,6 @@ app.post("/replay-dlq", async (req, res) => {
         return res.json({ status: "empty", replayed: 0 });
     }
 
-    // publish all at once
     for (const content of batch) {
         channel.sendToQueue(
             "order_items",
@@ -157,7 +154,6 @@ app.post("/replay-dlq", async (req, res) => {
         );
     }
 
-    // ack all at once
     msgs.forEach(m => channel.ack(m));
 
     console.log(`♻️ Replayed ${batch.length} messages from DLQ`);
@@ -183,18 +179,9 @@ function onMessage(msg) {
 
     } catch (err) {
 
-        // channel.nack(msg, false, false);
-        
-        const isDuplicate = err.code === 11000 ||
-        err.writeErrors?.every(e => e.code === 11000);
-
-        if (isDuplicate) {
-        // Safe to ack — unique index already blocked it
-           msgs.forEach(m => channel.ack(m));
-        } else {
-        // Retryable error — requeue instead of DLQ
-           msgs.forEach(m => channel.nack(m, false, true)); // requeue=true
-        }
+        // JSON parse failed — bad message, send straight to DLQ
+        console.error("Bad message, sending to DLQ:", err.message);
+        channel.nack(msg, false, false); // requeue=false → DLQ
     }
 }
 
@@ -213,7 +200,7 @@ async function flush() {
 
         await new Promise(r => setTimeout(r, ARTIFICIAL_DB_DELAY));
 
-        // ← randomly fail 30% of the time to trigger retries ---- Set to 0.3 to test retries, Set to 0 for Production
+        // ← randomly fail 30% of the time to trigger retries
         // if (Math.random() < 0.3) {
         //     throw new Error("Simulated DB failure");
         // }
@@ -226,14 +213,23 @@ async function flush() {
 
     } catch (err) {
 
-        console.log(`❌ Failed batch of ${ops.length} — retrying...`);
+        console.log(`❌ Failed batch of ${ops.length}`);
 
-        for (const m of msgs) 
-            await retryMessage(m);
-        
-} finally {
-    isFlushing = false;
-}
+        // ✅ Duplicate key error — unique index blocked it, safe to ack
+        const isDuplicate = err.code === 11000 ||
+            err.writeErrors?.every(e => e.code === 11000);
+
+        if (isDuplicate) {
+            msgs.forEach(m => channel.ack(m));
+        } else {
+            // Retryable error (Mongo down, timeout etc) — use backoff retry
+            for (const m of msgs)
+                await retryMessage(m);
+        }
+
+    } finally {
+        isFlushing = false;
+    }
 }
 
 /* RETRY HANDLER */
@@ -244,7 +240,6 @@ async function retryMessage(msg) {
     const retryCount = headers["x-retry-count"] || 0;
 
     if (retryCount >= 3) {
-
         channel.nack(msg, false, false);
         console.log("Sent to DLQ");
         return;
@@ -288,3 +283,4 @@ init().then(() => {
         console.log("Listening on 3000");
     });
 });
+            
