@@ -183,7 +183,18 @@ function onMessage(msg) {
 
     } catch (err) {
 
-        channel.nack(msg, false, false);
+        // channel.nack(msg, false, false);
+        
+        const isDuplicate = err.code === 11000 ||
+        err.writeErrors?.every(e => e.code === 11000);
+
+        if (isDuplicate) {
+        // Safe to ack — unique index already blocked it
+           msgs.forEach(m => channel.ack(m));
+        } else {
+        // Retryable error — requeue instead of DLQ
+           msgs.forEach(m => channel.nack(m, false, true)); // requeue=true
+        }
     }
 }
 
@@ -217,12 +228,12 @@ async function flush() {
 
         console.log(`❌ Failed batch of ${ops.length} — retrying...`);
 
-        for (const m of msgs) {
+        for (const m of msgs) 
             await retryMessage(m);
-        }
-    }
-
+        
+} finally {
     isFlushing = false;
+}
 }
 
 /* RETRY HANDLER */
